@@ -356,6 +356,14 @@ class Database:
         conn.close()
         return new_status if result else None
 
+    def update_dish_photo(self, dish_id: int, photo_id: str):
+        """Обновление фото для существующего блюда"""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("UPDATE dishes SET photo_id = ? WHERE id = ?", (photo_id, dish_id))
+        conn.commit()
+        conn.close()
+
 # Создаем базу
 db = Database()
 
@@ -644,6 +652,7 @@ def dishes_admin_markup(dishes):
 def dish_admin_actions_markup(dish_id):
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="🔄 Изменить доступность", callback_data=f"admin_toggle_dish_{dish_id}"))
+    builder.add(InlineKeyboardButton(text="📸 Добавить/изменить фото", callback_data=f"admin_edit_dish_{dish_id}"))
     builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_manage_menu"))
     builder.adjust(1)
     return builder.as_markup()
@@ -765,6 +774,73 @@ async def show_cart(message: types.Message):
         await message.answer(cart_text)
     else:
         await message.answer(cart_text, reply_markup=cart_markup(cart["items"]), parse_mode="HTML")
+
+# ========== ОБРАБОТЧИКИ ДОБАВЛЕНИЯ ФОТО К СУЩЕСТВУЮЩИМ БЛЮДАМ ==========
+@dp.callback_query(F.data.startswith("admin_edit_dish_"))
+async def admin_edit_dish_start(callback: CallbackQuery, state: FSMContext):
+    """Начало редактирования блюда - запрос фото"""
+    if callback.from_user.id not in ADMINS:
+        await callback.answer("⛔ Доступ запрещен")
+        return
+    
+    dish_id = int(callback.data.split("_")[3])
+    await state.update_data(edit_dish_id=dish_id)
+    
+    dish_data = db.get_dish_details(dish_id)
+    if dish_data:
+        dish_name = dish_data[2]  # name находится на позиции 2
+        await callback.message.answer(
+            f"📸 <b>Добавление фото для блюда:</b> {dish_name}\n\n"
+            "Отправьте фото блюда как изображение (не как файл).\n"
+            "Если не хотите добавлять фото, отправьте /skip",
+            parse_mode="HTML"
+        )
+        await state.set_state(AdminStates.waiting_for_dish_photo)
+    else:
+        await callback.answer("Блюдо не найдено")
+    
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_dish_photo, F.photo | F.text == "/skip")
+async def admin_save_dish_photo(message: Message, state: FSMContext):
+    """Сохранение фото для существующего блюда"""
+    data = await state.get_data()
+    dish_id = data.get('edit_dish_id')
+    
+    if not dish_id:
+        await message.answer("❌ Ошибка: ID блюда не найден")
+        await state.clear()
+        return
+    
+    photo_id = None
+    if message.photo:
+        # Сохраняем file_id самого большого размера фото
+        photo_id = message.photo[-1].file_id
+        
+        # Обновляем фото в базе данных
+        db.update_dish_photo(dish_id, photo_id)
+        
+        dish_data = db.get_dish_details(dish_id)
+        dish_name = dish_data[2] if dish_data else "Блюдо"
+        
+        if photo_id:
+            # Отправляем подтверждение с фото
+            await message.answer_photo(
+                photo=photo_id,
+                caption=f"✅ <b>Фото успешно добавлено для блюда:</b> {dish_name}",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(f"✅ Блюдо '{dish_name}' обновлено без фото")
+    else:
+        await message.answer("❌ Фото не добавлено")
+    
+    await message.answer(
+        "👑 <b>Панель администратора</b>\n\nВыберите действие:",
+        reply_markup=admin_menu_markup(),
+        parse_mode="HTML"
+    )
+    await state.clear()
 
 # ========== ОБРАБОТЧИКИ АДМИНКИ ==========
 @dp.callback_query(F.data == "admin_stats")
