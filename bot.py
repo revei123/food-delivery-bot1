@@ -53,6 +53,7 @@ class AdminStates(StatesGroup):
     waiting_for_dish_description = State()
     waiting_for_dish_ingredients = State()
     waiting_for_dish_price = State()
+    waiting_for_dish_photo = State()
     waiting_for_dish_category = State()
 
 # ========== БАЗА ДАННЫХ ==========
@@ -331,13 +332,13 @@ class Database:
         conn.close()
         return users
 
-    def add_dish(self, category_id: int, name: str, description: str, ingredients: str, price: int):
+    def add_dish(self, category_id: int, name: str, description: str, ingredients: str, price: int, photo_id: str = None):
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         cur.execute('''
-        INSERT INTO dishes (category_id, name, description, ingredients, price, available)
-        VALUES (?, ?, ?, ?, ?, 1)
-        ''', (category_id, name, description, ingredients, price))
+        INSERT INTO dishes (category_id, name, description, ingredients, price, photo_id, available)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        ''', (category_id, name, description, ingredients, price, photo_id))
         dish_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -939,12 +940,29 @@ async def admin_add_dish_price(message: Message, state: FSMContext):
         await state.update_data(dish_price=price)
         
         await message.answer(
-            "Выберите категорию для блюда:",
-            reply_markup=categories_markup_for_admin()
+            "📸 <b>Отправьте фото блюда:</b>\n\n"
+            "Просто отправьте изображение как фото (не как файл).\n"
+            "Если фото нет, отправьте /skip",
+            parse_mode="HTML"
         )
-        await state.set_state(AdminStates.waiting_for_dish_category)
+        await state.set_state(AdminStates.waiting_for_dish_photo)
     except ValueError:
         await message.answer("Пожалуйста, введите корректную цену (только число):")
+
+@dp.message(AdminStates.waiting_for_dish_photo, F.photo | F.text == "/skip")
+async def admin_add_dish_photo(message: Message, state: FSMContext):
+    photo_id = None
+    if message.photo:
+        # Сохраняем file_id самого большого размера фото
+        photo_id = message.photo[-1].file_id
+    
+    await state.update_data(dish_photo=photo_id)
+    
+    await message.answer(
+        "Выберите категорию для блюда:",
+        reply_markup=categories_markup_for_admin()
+    )
+    await state.set_state(AdminStates.waiting_for_dish_category)
 
 @dp.callback_query(F.data.startswith("admin_category_"), AdminStates.waiting_for_dish_category)
 async def admin_add_dish_final(callback: CallbackQuery, state: FSMContext):
@@ -956,18 +974,27 @@ async def admin_add_dish_final(callback: CallbackQuery, state: FSMContext):
         data['dish_name'],
         data['dish_description'],
         data['dish_ingredients'],
-        data['dish_price']
+        data['dish_price'],
+        data.get('dish_photo')
     )
     
-    await callback.message.edit_text(
-        f"✅ <b>Блюдо успешно добавлено!</b>\n\n"
-        f"🍽 <b>Название:</b> {data['dish_name']}\n"
-        f"📝 <b>Описание:</b> {data['dish_description']}\n"
-        f"🧂 <b>Состав:</b> {data['dish_ingredients']}\n"
-        f"💵 <b>Цена:</b> {data['dish_price']} руб.\n"
-        f"📁 <b>ID блюда:</b> {dish_id}",
-        parse_mode="HTML",
-        reply_markup=admin_menu_markup()
+    success_text = f"✅ <b>Блюдо успешно добавлено!</b>\n\n🍽 <b>Название:</b> {data['dish_name']}"
+    
+    if data.get('dish_photo'):
+        # Если есть фото, отправляем сообщение с фото
+        await callback.message.answer_photo(
+            photo=data['dish_photo'],
+            caption=success_text,
+            parse_mode="HTML"
+        )
+    else:
+        # Если фото нет, отправляем просто текст
+        await callback.message.answer(success_text, parse_mode="HTML")
+    
+    await callback.message.answer(
+        "👑 <b>Панель администратора</b>\n\nВыберите действие:",
+        reply_markup=admin_menu_markup(),
+        parse_mode="HTML"
     )
     await state.clear()
     await callback.answer()
@@ -1103,35 +1130,32 @@ async def show_dish_details(callback: CallbackQuery):
     
     dish_text = format_dish_details(dish_data)
     category_id = dish_data[1]
+    photo_id = dish_data[6]  # photo_id из базы данных
     
-    if dish_data[6]:
+    if photo_id:
+        # Если есть фото, отправляем фото с подписью
         try:
             await callback.message.delete()
             await callback.message.answer_photo(
-                photo=dish_data[6],
+                photo=photo_id,
                 caption=dish_text,
                 reply_markup=dish_detail_markup(dish_id, category_id),
                 parse_mode="HTML"
             )
         except Exception as e:
+            # Если фото не загрузилось, отправляем текст
             await callback.message.answer(
                 dish_text,
                 reply_markup=dish_detail_markup(dish_id, category_id),
                 parse_mode="HTML"
             )
     else:
-        try:
-            await callback.message.edit_text(
-                dish_text,
-                reply_markup=dish_detail_markup(dish_id, category_id),
-                parse_mode="HTML"
-            )
-        except:
-            await callback.message.answer(
-                dish_text,
-                reply_markup=dish_detail_markup(dish_id, category_id),
-                parse_mode="HTML"
-            )
+        # Если фото нет, отправляем только текст
+        await callback.message.answer(
+            dish_text,
+            reply_markup=dish_detail_markup(dish_id, category_id),
+            parse_mode="HTML"
+        )
     
     await callback.answer()
 
@@ -1427,6 +1451,5 @@ async def main():
     except Exception as e:
         logger.error(f"Ошибка при запуске бота: {e}")
 
-# Это очень важно для PythonAnywhere!
 if __name__ == "__main__":
     asyncio.run(main())
