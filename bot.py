@@ -833,6 +833,49 @@ async def test_dish_display(message: Message):
     else:
         await message.answer(f"❌ У блюда '{name}' нет фото")
 
+@dp.message(Command("test_save_photo"))
+async def test_save_photo(message: Message):
+    """Тест сохранения фото для первого блюда"""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    # Берем первое блюдо из базы
+    conn = sqlite3.connect(db.db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM dishes LIMIT 1")
+    dish = cur.fetchone()
+    conn.close()
+    
+    if not dish:
+        await message.answer("❌ В базе нет блюд")
+        return
+    
+    dish_id, dish_name = dish
+    
+    # Создаем тестовый photo_id (просто для демонстрации)
+    test_photo_id = "test_photo_id_12345"
+    
+    try:
+        # Пытаемся сохранить
+        conn = sqlite3.connect(db.db_path)
+        cur = conn.cursor()
+        cur.execute("UPDATE dishes SET photo_id = ? WHERE id = ?", (test_photo_id, dish_id))
+        conn.commit()
+        
+        # Проверяем
+        cur.execute("SELECT photo_id FROM dishes WHERE id = ?", (dish_id,))
+        result = cur.fetchone()
+        saved_photo = result[0] if result else None
+        conn.close()
+        
+        if saved_photo == test_photo_id:
+            await message.answer(f"✅ Тест пройден! Фото успешно сохраняется в базу.\nБлюдо: {dish_name}\nСохраненный photo_id: {saved_photo}")
+        else:
+            await message.answer(f"❌ Тест не пройден! Ожидалось: {test_photo_id}, Получено: {saved_photo}")
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при тестировании: {e}")
+
 @dp.message(Command("reset_db"))
 async def reset_db(message: Message):
     """Полный сброс базы данных (только для админов)"""
@@ -992,59 +1035,80 @@ async def admin_edit_dish_start(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer()
 
-@dp.message(AdminStates.waiting_for_dish_photo, F.photo | F.text == "/skip")
+@dp.message(AdminStates.waiting_for_dish_photo)
 async def admin_save_dish_photo(message: Message, state: FSMContext):
-    """Сохранение фото для существующего блюда - УЛУЧШЕННАЯ ВЕРСИЯ"""
-    data = await state.get_data()
-    dish_id = data.get('edit_dish_id')
-    
-    if not dish_id:
-        await message.answer("❌ Ошибка: ID блюда не найден")
-        await state.clear()
-        return
-    
-    photo_id = None
-    if message.photo:
-        try:
-            # Сохраняем file_id самого большого размера фото
-            photo_id = message.photo[-1].file_id
-            logger.info(f"Получено фото для блюда {dish_id}, photo_id: {photo_id}")
-            
-            # Обновляем фото в базе данных
-            db.update_dish_photo(dish_id, photo_id)
-            logger.info(f"Фото сохранено в базу для блюда {dish_id}")
-            
-            # Проверяем, что фото действительно сохранилось
-            dish_data = db.get_dish_details(dish_id)
-            saved_photo_id = dish_data[6] if dish_data else None
-            
-            dish_name = dish_data[2] if dish_data else "Блюдо"
-            
-            if saved_photo_id == photo_id:
-                # Отправляем подтверждение с фото
-                await message.answer_photo(
-                    photo=photo_id,
-                    caption=f"✅ <b>Фото успешно добавлено для блюда:</b> {dish_name}\n\nID фото: {photo_id[:30]}...",
-                    parse_mode="HTML"
-                )
-                logger.info(f"✅ Фото подтверждено для блюда {dish_id}")
-            else:
-                await message.answer(f"❌ Ошибка: фото не сохранилось в базе данных")
-                logger.error(f"Фото не сохранилось: ожидалось {photo_id}, получено {saved_photo_id}")
+    """Сохранение фото для существующего блюда - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    try:
+        data = await state.get_data()
+        dish_id = data.get('edit_dish_id')
+        
+        logger.info(f"🔄 Обработчик фото вызван для dish_id: {dish_id}, тип контента: {message.content_type}")
+        
+        if not dish_id:
+            await message.answer("❌ Ошибка: ID блюда не найден. Начните заново.")
+            await state.clear()
+            return
+        
+        # Получаем информацию о блюде для логов
+        dish_data = db.get_dish_details(dish_id)
+        dish_name = dish_data[2] if dish_data else "Неизвестное блюдо"
+        
+        if message.photo:
+            try:
+                # Сохраняем file_id самого большого размера фото
+                photo_id = message.photo[-1].file_id
+                logger.info(f"📸 Получено фото для блюда '{dish_name}' (ID: {dish_id}), photo_id: {photo_id}")
                 
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении фото: {e}")
-            await message.answer(f"❌ Ошибка при сохранении фото: {e}")
-    else:
-        await message.answer("📸 Фото не было добавлено")
-        logger.info(f"Для блюда {dish_id} фото не было добавлено (пропущено)")
-    
-    await message.answer(
-        "👑 <b>Панель администратора</b>\n\nВыберите действие:",
-        reply_markup=admin_menu_markup(),
-        parse_mode="HTML"
-    )
-    await state.clear()
+                # ОБНОВЛЯЕМ БАЗУ ДАННЫХ - КЛЮЧЕВОЙ МОМЕНТ!
+                conn = sqlite3.connect(db.db_path)
+                cur = conn.cursor()
+                cur.execute("UPDATE dishes SET photo_id = ? WHERE id = ?", (photo_id, dish_id))
+                conn.commit()
+                
+                # Проверяем, что фото сохранилось
+                cur.execute("SELECT photo_id FROM dishes WHERE id = ?", (dish_id,))
+                result = cur.fetchone()
+                saved_photo_id = result[0] if result else None
+                conn.close()
+                
+                logger.info(f"💾 Фото сохранено в базу. Ожидалось: {photo_id}, Сохранено: {saved_photo_id}")
+                
+                if saved_photo_id == photo_id:
+                    # Успешно - отправляем подтверждение с фото
+                    await message.answer_photo(
+                        photo=photo_id,
+                        caption=f"✅ <b>Фото успешно добавлено для блюда:</b> {dish_name}\n\nID фото: {photo_id[:30]}...",
+                        parse_mode="HTML"
+                    )
+                    logger.info(f"✅ Фото подтверждено для блюда {dish_id} ('{dish_name}')")
+                else:
+                    await message.answer(f"❌ Ошибка: фото не сохранилось в базе данных. Ожидалось: {photo_id}, Получено: {saved_photo_id}")
+                    logger.error(f"Фото не сохранилось: ожидалось {photo_id}, получено {saved_photo_id}")
+                    
+            except Exception as e:
+                logger.error(f"💥 Критическая ошибка при сохранении фото: {e}")
+                await message.answer(f"❌ Критическая ошибка при сохранении фото: {e}")
+        
+        elif message.text and message.text == "/skip":
+            logger.info(f"⏭️ Пропущено добавление фото для блюда {dish_id} ('{dish_name}')")
+            await message.answer(f"📸 Фото не было добавлено для блюда '{dish_name}'")
+        
+        else:
+            await message.answer("❌ Пожалуйста, отправьте фото как изображение или введите /skip для пропуска")
+            return
+        
+        # Возвращаем в админ-панель
+        await message.answer(
+            "👑 <b>Панель администратора</b>\n\nВыберите действие:",
+            reply_markup=admin_menu_markup(),
+            parse_mode="HTML"
+        )
+        await state.clear()
+        
+    except Exception as e:
+        logger.error(f"💥 Общая ошибка в обработчике фото: {e}")
+        await message.answer(f"❌ Произошла непредвиденная ошибка: {e}")
+        await state.clear()
 
 # ========== ОБРАБОТЧИКИ АДМИНКИ ==========
 @dp.callback_query(F.data == "admin_stats")
