@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sqlite3
 import json
+import os
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Optional
 from aiogram import Bot, Dispatcher, types, F
@@ -61,6 +62,7 @@ class Database:
     def __init__(self, db_path="food_bot.db"):
         self.db_path = db_path
         self.init_db()
+        self.force_update_structure()  # Принудительное обновление структуры
 
     def init_db(self):
         """Инициализация базы данных"""
@@ -149,6 +151,28 @@ class Database:
             logger.info("База данных инициализирована")
         except Exception as e:
             logger.error(f"Ошибка инициализации БД: {e}")
+
+    def force_update_structure(self):
+        """Принудительное обновление структуры базы данных"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            
+            # Проверяем и добавляем столбец photo_id если его нет
+            try:
+                cur.execute("SELECT photo_id FROM dishes LIMIT 1")
+                logger.info("✅ Столбец photo_id уже существует")
+            except sqlite3.OperationalError:
+                logger.info("🔄 Добавляем столбец photo_id в таблицу dishes")
+                cur.execute("ALTER TABLE dishes ADD COLUMN photo_id TEXT")
+                conn.commit()
+                logger.info("✅ Столбец photo_id добавлен")
+            
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления структуры: {e}")
+            return False
 
     def _seed_data(self, cur):
         """Заполнение начальными данными"""
@@ -657,6 +681,173 @@ def dish_admin_actions_markup(dish_id):
     builder.adjust(1)
     return builder.as_markup()
 
+# ========== ДИАГНОСТИЧЕСКИЕ КОМАНДЫ ==========
+@dp.message(Command("debug_photos"))
+async def debug_photos(message: Message):
+    """Диагностика проблемы с фото"""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    # Проверяем структуру базы данных
+    conn = sqlite3.connect(db.db_path)
+    cur = conn.cursor()
+    
+    # Проверяем столбец photo_id
+    try:
+        cur.execute("PRAGMA table_info(dishes)")
+        columns = cur.fetchall()
+        photo_column_exists = any(col[1] == 'photo_id' for col in columns)
+        
+        # Проверяем данные
+        cur.execute("SELECT id, name, photo_id FROM dishes LIMIT 5")
+        dishes = cur.fetchall()
+        
+        report = f"🔍 <b>Диагностика фото:</b>\n\n"
+        report += f"📊 Столбец photo_id существует: {'✅ Да' if photo_column_exists else '❌ Нет'}\n"
+        
+        report += f"\n<b>Примеры блюд:</b>\n"
+        for dish in dishes:
+            dish_id, name, photo_id = dish
+            has_photo = "✅ Есть" if photo_id else "❌ Нет"
+            photo_preview = f" ({photo_id[:20]}...)" if photo_id else ""
+            report += f"• {name}: {has_photo}{photo_preview}\n"
+            
+    except Exception as e:
+        report = f"❌ Ошибка диагностики: {e}"
+    
+    conn.close()
+    await message.answer(report, parse_mode="HTML")
+
+@dp.message(Command("fix_photos"))
+async def fix_photos(message: Message):
+    """Исправление структуры базы данных для фото"""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    try:
+        conn = sqlite3.connect(db.db_path)
+        cur = conn.cursor()
+        
+        # Проверяем и добавляем столбец photo_id если его нет
+        try:
+            cur.execute("SELECT photo_id FROM dishes LIMIT 1")
+            await message.answer("✅ Столбец photo_id уже существует")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE dishes ADD COLUMN photo_id TEXT")
+            conn.commit()
+            await message.answer("✅ Столбец photo_id успешно добавлен в таблицу dishes")
+        
+        conn.close()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при исправлении: {e}")
+
+@dp.message(Command("check_photos"))
+async def check_photos_command(message: Message):
+    """Проверка всех блюд и их фото"""
+    if message.from_user.id not in ADMINS:
+        await message.answer("⛔ У вас нет доступа")
+        return
+    
+    conn = sqlite3.connect(db.db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, category_id, photo_id FROM dishes")
+    dishes = cur.fetchall()
+    conn.close()
+    
+    dishes_with_photos = 0
+    dishes_without_photos = 0
+    dishes_by_category = {}
+    
+    for dish in dishes:
+        dish_id, name, category_id, photo_id = dish
+        category_name = {1: "🥙 Шаурма", 2: "🍔 Бургеры", 3: "🍕 Пицца", 4: "🔥 Шаурма на углях"}.get(category_id, "Неизвестно")
+        
+        if category_name not in dishes_by_category:
+            dishes_by_category[category_name] = {"with_photo": 0, "without_photo": 0}
+        
+        if photo_id:
+            dishes_with_photos += 1
+            dishes_by_category[category_name]["with_photo"] += 1
+        else:
+            dishes_without_photos += 1
+            dishes_by_category[category_name]["without_photo"] += 1
+    
+    # Формируем отчет
+    report = f"📊 <b>Отчет по фото блюд</b>\n\n"
+    report += f"📸 Блюд с фото: <b>{dishes_with_photos}</b>\n"
+    report += f"❌ Блюд без фото: <b>{dishes_without_photos}</b>\n"
+    report += f"🍽 Всего блюд: <b>{len(dishes)}</b>\n\n"
+    
+    report += "<b>По категориям:</b>\n"
+    for category, stats in dishes_by_category.items():
+        total = stats["with_photo"] + stats["without_photo"]
+        percentage = (stats["with_photo"] / total * 100) if total > 0 else 0
+        report += f"• {category}: {stats['with_photo']}/{total} ({percentage:.1f}%)\n"
+    
+    await message.answer(report, parse_mode="HTML")
+    
+    # Показываем примеры блюд без фото
+    if dishes_without_photos > 0:
+        no_photo_dishes = []
+        for dish in dishes:
+            if not dish[3]:  # photo_id is None or empty
+                no_photo_dishes.append(dish[1])  # dish name
+        
+        if no_photo_dishes:
+            sample = no_photo_dishes[:5]  # Показываем первые 5
+            sample_text = "\n".join([f"• {name}" for name in sample])
+            more_text = f"\n\n... и еще {len(no_photo_dishes) - 5}" if len(no_photo_dishes) > 5 else ""
+            await message.answer(
+                f"📋 <b>Примеры блюд без фото:</b>\n{sample_text}{more_text}",
+                parse_mode="HTML"
+            )
+
+@dp.message(Command("test_dish"))
+async def test_dish_display(message: Message):
+    """Тест отображения блюда с фото"""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    # Берем первое блюдо из базы для теста
+    conn = sqlite3.connect(db.db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, photo_id FROM dishes LIMIT 1")
+    dish = cur.fetchone()
+    conn.close()
+    
+    if not dish:
+        await message.answer("В базе нет блюд")
+        return
+    
+    dish_id, name, photo_id = dish
+    
+    if photo_id:
+        try:
+            await message.answer_photo(
+                photo=photo_id,
+                caption=f"✅ <b>Тест фото:</b> {name}\nID фото: {photo_id[:20]}...",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await message.answer(f"❌ Ошибка отображения фото: {e}")
+    else:
+        await message.answer(f"❌ У блюда '{name}' нет фото")
+
+@dp.message(Command("reset_db"))
+async def reset_db(message: Message):
+    """Полный сброс базы данных (только для админов)"""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    try:
+        if os.path.exists(db.db_path):
+            os.remove(db.db_path)
+            await message.answer("🗑️ База данных удалена. Перезапустите бота для создания новой.")
+        else:
+            await message.answer("❌ Файл базы данных не найден")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при удалении базы: {e}")
+
 # ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -803,7 +994,7 @@ async def admin_edit_dish_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_dish_photo, F.photo | F.text == "/skip")
 async def admin_save_dish_photo(message: Message, state: FSMContext):
-    """Сохранение фото для существующего блюда"""
+    """Сохранение фото для существующего блюда - УЛУЧШЕННАЯ ВЕРСИЯ"""
     data = await state.get_data()
     dish_id = data.get('edit_dish_id')
     
@@ -814,26 +1005,39 @@ async def admin_save_dish_photo(message: Message, state: FSMContext):
     
     photo_id = None
     if message.photo:
-        # Сохраняем file_id самого большого размера фото
-        photo_id = message.photo[-1].file_id
-        
-        # Обновляем фото в базе данных
-        db.update_dish_photo(dish_id, photo_id)
-        
-        dish_data = db.get_dish_details(dish_id)
-        dish_name = dish_data[2] if dish_data else "Блюдо"
-        
-        if photo_id:
-            # Отправляем подтверждение с фото
-            await message.answer_photo(
-                photo=photo_id,
-                caption=f"✅ <b>Фото успешно добавлено для блюда:</b> {dish_name}",
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer(f"✅ Блюдо '{dish_name}' обновлено без фото")
+        try:
+            # Сохраняем file_id самого большого размера фото
+            photo_id = message.photo[-1].file_id
+            logger.info(f"Получено фото для блюда {dish_id}, photo_id: {photo_id}")
+            
+            # Обновляем фото в базе данных
+            db.update_dish_photo(dish_id, photo_id)
+            logger.info(f"Фото сохранено в базу для блюда {dish_id}")
+            
+            # Проверяем, что фото действительно сохранилось
+            dish_data = db.get_dish_details(dish_id)
+            saved_photo_id = dish_data[6] if dish_data else None
+            
+            dish_name = dish_data[2] if dish_data else "Блюдо"
+            
+            if saved_photo_id == photo_id:
+                # Отправляем подтверждение с фото
+                await message.answer_photo(
+                    photo=photo_id,
+                    caption=f"✅ <b>Фото успешно добавлено для блюда:</b> {dish_name}\n\nID фото: {photo_id[:30]}...",
+                    parse_mode="HTML"
+                )
+                logger.info(f"✅ Фото подтверждено для блюда {dish_id}")
+            else:
+                await message.answer(f"❌ Ошибка: фото не сохранилось в базе данных")
+                logger.error(f"Фото не сохранилось: ожидалось {photo_id}, получено {saved_photo_id}")
+                
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении фото: {e}")
+            await message.answer(f"❌ Ошибка при сохранении фото: {e}")
     else:
-        await message.answer("❌ Фото не добавлено")
+        await message.answer("📸 Фото не было добавлено")
+        logger.info(f"Для блюда {dish_id} фото не было добавлено (пропущено)")
     
     await message.answer(
         "👑 <b>Панель администратора</b>\n\nВыберите действие:",
